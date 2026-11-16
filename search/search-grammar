@@ -1,0 +1,9 @@
+atom       : "!" atom | STRING | WORD | "(" search ")"
+
+atom-list  : atom(":"atom?)*
+
+comparison : atom "!"? (">"|"<"|"="|"<="|">="|"=="|"~") atom
+
+gate       : comparison (("&"|"|") comparison)*
+
+search: gate

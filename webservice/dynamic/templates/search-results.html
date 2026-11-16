@@ -1,0 +1,24 @@
+{{ define "search-results" }}
+<head>
+    <link rel="stylesheet" href="/css/general.css">
+    <link rel="stylesheet" href="/lite/css/item-table.css">
+</head>
+
+<body>
+    <table id='info-table'>
+        <tr>
+            <th>ItemId</th>
+            <th>En_Title</th>
+            <th>Native_Title</th>
+            <th>Format</th>
+            <th>Location</th>
+            <th>Collection</th>
+            <th>Type</th>
+            <th>ArtStyle</th>
+        </tr>
+        {{range . }}
+            {{template "search-result-row" .}}
+        {{ end}}
+    </table>
+</body>
+{{end}}

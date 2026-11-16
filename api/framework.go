@@ -1,0 +1,603 @@
+package api
+
+import (
+	"compress/gzip"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"net/http"
+	"os"
+	"reflect"
+	"regexp"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"mediatracker/accounts"
+	"mediatracker/db"
+	"mediatracker/logging"
+	"mediatracker/metadata"
+	"mediatracker/types"
+	"mediatracker/util"
+)
+
+func actx2dctx(ctx RequestContext) db.RequestContext {
+	return db.RequestContext{
+		UID: ctx.Uid,
+		Auth: ctx.Authorized,
+	}
+}
+
+type (
+	Parser      = func(ctx RequestContext, in string) (any, error)
+	QueryParams = map[string]QueryParamInfo
+)
+
+type QueryParamInfo struct {
+	Parser   Parser
+	Required bool
+}
+
+//TODO:
+//AIO_PATH should be a thing here so each seperate endpoint doesn't need to figure it out itself
+type RequestContext struct {
+	Uid        int64
+	Req        *http.Request
+	W          http.ResponseWriter
+	Authorized int64
+	PP         ParsedParams
+	GuestAllowed bool
+}
+
+func MkQueryInfo(parser Parser, required bool) QueryParamInfo {
+	return QueryParamInfo{
+		Parser: parser, Required: required,
+	}
+}
+
+type ParsedParams map[string]any
+
+func (self *ParsedParams) Get(name string, backup any) any {
+	if v, exists := (*self)[name]; exists {
+		return v
+	}
+	return backup
+}
+
+func (self *ParsedParams) Has(name string) bool {
+	if _, exists := (*self)[name]; exists {
+		return true
+	}
+	return false
+}
+
+type MethodSpec struct {
+	Description string
+	Returns string
+	Params QueryParams
+	ParamsFromBodyAllowed bool
+	// whether or not auth is required, false == auth required, true == auth not required
+	// it's named this way, so that by default, auth is intuitively required
+	// because by default this will be false
+	GuestAllowed bool
+
+	// whether or not a user id is a required parameter
+	UserIndependant bool
+
+	Deprecated string
+}
+
+type ApiEndPoint struct {
+	Handler        func(ctx RequestContext)
+	EndPoint       string
+	PathParams     QueryParams
+	Aliases        []string
+	Methods        map[string]MethodSpec
+	Description    string
+	Returns        string
+	PossibleErrors []string
+
+	Deprecated string
+}
+
+func pParser2Name(name string) string{
+	return name[2:]
+}
+func parser2Type(pName string) string {
+	if pName[0] == 'P' {
+		return pParser2Name(pName)
+	}
+	if strings.Contains(pName, "P_TList") {
+		return "List[Unknown]"
+	}
+	return ""
+}
+
+func (self *ApiEndPoint) GenerateDocHTML(root string) string {
+	tags := strings.Builder{}
+
+	methodHTML := strings.Builder{}
+
+	for mthdName, mthd := range self.Methods {
+		fmt.Fprintf(&tags, "<div class='tag'>%s</div>", mthdName)
+		mthdTags := ""
+
+		if !mthd.GuestAllowed {
+			mthdTags += "<div class='tag focus'>Auth</div>"
+		}
+
+		if !mthd.UserIndependant {
+			mthdTags += "<div class='tag'>UID</div>"
+		}
+
+		paramHTMLBuilder := strings.Builder{}
+		if len(mthd.Params) > 0 {
+			paramHTMLBuilder.WriteString("<h4>URL Parameters</h4><dl class='params'>")
+			for name, info := range mthd.Params {
+				fnName := runtime.FuncForPC(reflect.ValueOf(info.Parser).Pointer()).Name()
+				fnName = parser2Type(fnName[len("mediatracker/api."):])
+				displayName := name
+				if info.Required {
+					displayName = fmt.Sprintf("<b>%s</b> (required)", displayName)
+				}
+				fmt.Fprintf(&paramHTMLBuilder, "<dt>%s <dd> %s", displayName, fnName)
+			}
+			paramHTMLBuilder.WriteString("</dl>")
+		}
+
+		nameTitle := fmt.Sprintf("<h3>%s</h3>", mthdName)
+		if mthd.Deprecated != "" {
+			nameTitle = fmt.Sprintf("<h3><del>%s</del></h3>", mthdName)
+			mthdTags += "<div class='tag focus'>Deprecated</div>"
+		}
+
+		thisMthdHTML := "<article>"
+		thisMthdHTML += fmt.Sprintf(`
+				<aside class="tags">%s</aside>
+				%s
+				<p>%s</p>
+				<p>%s</p>
+				%s`, mthdTags, nameTitle, mthd.Deprecated, mthd.Description, paramHTMLBuilder.String())
+		thisMthdHTML += "</article>"
+		methodHTML.WriteString(thisMthdHTML)
+	}
+
+	name := fmt.Sprintf("%s/%s", root, self.EndPoint)
+	nameTitle := fmt.Sprintf("<h2>%s</h2>", name)
+
+	if self.Deprecated != "" {
+		nameTitle = fmt.Sprintf("<h2><del>%s</del></h2>", name)
+		tags.WriteString("<div class='tag focus'>Deprecated</div>")
+	}
+
+	return fmt.Sprintf(`
+		<article class='endpoint' id='%s'>
+			<aside class="tags">%s</aside>
+			%s
+
+			<p>%s</p>
+			<p>%s</p>
+
+			<h3>Returns</h3>
+				<p>%s</p>
+
+			<h3>Methods</h3>
+			<section class="methods">
+			%s
+			</section>
+		</article>
+	`, name, tags.String(), nameTitle, self.Deprecated, self.Description, self.Returns, methodHTML.String())
+}
+
+
+func ckAuthorizationHeader(text string) (string, error) {
+	var estring string
+
+	if b64L := strings.SplitN(text, "Basic ", 2); len(b64L) > 1 {
+		b64 := b64L[1]
+		info, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			estring = "You're bad at encoding base64 😀\n"
+			logging.ELog(err)
+			goto unauthorized
+		}
+		username, password, found := strings.Cut(string(info), ":")
+		if !found {
+			estring = "Invalid credentials\n"
+			goto unauthorized
+		}
+
+		uid, err := accounts.CkLogin(username, password)
+
+		if err != nil {
+			logging.ELog(err)
+			return "", err
+		}
+
+		if uid == "" {
+			return "", err
+		}
+
+		return uid, nil
+	}
+
+unauthorized:
+	return "", errors.New(estring)
+}
+
+func (self *ApiEndPoint) Listener(w http.ResponseWriter, req *http.Request) {
+	parsedParams := ParsedParams{}
+
+	ctx := RequestContext{}
+	ctx.Req = req
+	ctx.W = w
+
+	//"preflight" request
+	if req.Method == "OPTIONS" {
+		w.WriteHeader(200)
+		return
+	}
+
+	methodSpec, has := self.Methods[req.Method]
+
+	if len(self.Methods) > 0 && !has {
+		w.WriteHeader(405)
+		fmt.Fprintf(w, "Invalid method: '%s', expected: %s", req.Method, strings.Join(
+			slices.Collect(maps.Keys(self.Methods)),
+			", ",
+		))
+		return
+	} else if len(self.Methods) == 0 {
+		methodSpec = MethodSpec{}
+	}
+
+	ctx.GuestAllowed = methodSpec.GuestAllowed
+
+	var uidStr = req.URL.Query().Get("uid")
+
+	authorized := true
+
+	privateAll := os.Getenv("AIO_PRIVATE")
+	if !methodSpec.GuestAllowed || privateAll != "" {
+		auth := req.Header.Get("Authorization")
+
+		if auth == "" {
+			authorized = false
+		}
+
+		newUid, err := ckAuthorizationHeader(auth)
+
+		if newUid == "" || err != nil {
+			authorized = false
+		}
+
+		if newUid != uidStr && uidStr != "" {
+			//mismatch between requested uid, and the account that the user is logged into
+			//this is important because the user is trying to perform a priveledged action for UID while not logged into that UID
+			authorized = false
+		}
+
+		if !authorized {
+			w.Header().Add("WWW-Authenticate", "Basic realm=\"/\"")
+			w.WriteHeader(401)
+			return
+		}
+
+		uidInt, err := strconv.ParseInt(newUid, 10, 64)
+
+		if err != nil {
+			w.WriteHeader(400)
+			fmt.Fprintf(w, "Invalid user id, %s", err.Error())
+			return
+		}
+
+		ctx.Authorized = uidInt
+		uidStr = newUid
+	} else {
+		ctx.Authorized = 0
+	}
+
+	query := req.URL.Query()
+
+	uidInt := int64(-1)
+
+	// uid is required on almost all endpoints, so
+	// have UserIndependant that keeps track of if it's **not** required
+	// this also saves the hassle of having to say it is required in QueryParams
+	if !methodSpec.UserIndependant && uidStr == "" {
+		w.WriteHeader(400)
+		fmt.Fprintf(w, "Missing parameter: 'uid'")
+		return
+	} else if uidStr != "" {
+		var err error
+		uidInt, err = strconv.ParseInt(uidStr, 10, 64)
+		if err != nil {
+			w.WriteHeader(400)
+			fmt.Fprintf(w, "Invalid user id, %s", err.Error())
+			return
+		}
+	}
+
+	jsonD := map[string]string{}
+	jsonAllowed := methodSpec.ParamsFromBodyAllowed && strings.ToLower(ctx.Req.Header.Get("Content-Type")) == "application/json"
+	if jsonAllowed {
+		defer ctx.Req.Body.Close()
+		jsonT, err := io.ReadAll(ctx.Req.Body)
+		if err != nil {
+			util.WError(w, 500, "could not read body: %s", err)
+			return
+		}
+
+		if len(jsonT) > 0 {
+			err = json.Unmarshal(jsonT, &jsonD)
+			if err != nil {
+				util.WError(w, 400, "invalid json: %s", err)
+				return
+			}
+		}
+	}
+
+	for name, info := range methodSpec.Params {
+		jsonVal, jsonHas := jsonD[name]
+		if !query.Has(name) && !jsonHas {
+			if info.Required {
+				w.WriteHeader(400)
+				fmt.Fprintf(w, "Missing parameter: '%s'", name)
+				return
+			}
+			continue
+		}
+
+		var queryVal string
+		if jsonHas {
+			queryVal = jsonVal
+		} else {
+			queryVal = query.Get(name)
+		}
+
+		val, err := info.Parser(ctx, queryVal)
+		if err != nil {
+			w.WriteHeader(400)
+			funcName := runtime.FuncForPC(reflect.ValueOf(info.Parser).Pointer()).Name()
+			fmt.Fprintf(w, "%s\nInvalid value for: '%s'\nexpected to pass: '%s'", err.Error(), name, funcName)
+			return
+		}
+
+		parsedParams[name] = val
+	}
+
+	for name, info := range self.PathParams {
+		if req.PathValue(name) == ""{
+			if info.Required {
+				w.WriteHeader(400)
+				fmt.Fprintf(w, "Missing path parameter: '%s'", name)
+				return
+			}
+			continue
+		}
+
+		strval := req.PathValue(name)
+		val, err := info.Parser(ctx, strval)
+		if err != nil {
+			w.WriteHeader(400)
+			funcName := runtime.FuncForPC(reflect.ValueOf(info.Parser).Pointer()).Name()
+			fmt.Fprintf(w, "%s\nInvalid value for: '%s'\nexpected to pass: '%s'", err.Error(), name, funcName)
+			return
+		}
+		parsedParams[name] = val
+	}
+
+	ctx.PP = parsedParams
+	ctx.Uid = uidInt
+
+	r := ctx.Req
+
+	var gz *gzip.Writer
+
+	acceptedEncoding := r.Header.Get("Accept-Encoding")
+	if strings.Contains(acceptedEncoding, "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		gz = gzip.NewWriter(w)
+		defer gz.Close()
+		w = gzipResponseWriter{Writer: gz, ResponseWriter: w}
+	}
+
+	ctx.W = w
+
+	self.Handler(ctx)
+}
+
+func P_Int64(ctx RequestContext, in string) (any, error) {
+	i, err := strconv.ParseInt(in, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return i, nil
+}
+
+func P_Float64(ctx RequestContext, in string) (any, error) {
+	f, err := strconv.ParseFloat(in, 64)
+	if err != nil {
+		return 0, err
+	}
+	return f, nil
+}
+
+func _verifyIdAndGet[T any](ctx RequestContext, id string, getter func(db.RequestContext, int64) (T, error)) (T, error) {
+	var out T
+	i, err := P_Int64(ctx, id)
+	if err != nil {
+		return out, err
+	}
+	entry, err := getter(db.RequestContext{UID: ctx.Uid, Auth: ctx.Authorized}, i.(int64))
+	if err != nil {
+		return out, err
+	}
+
+	if !ctx.GuestAllowed && reflect.ValueOf(entry).FieldByName("Uid").Int() != ctx.Authorized {
+		return out, errors.New("attempting to access an item from another user with priveleged access")
+	}
+
+	return entry, nil
+}
+
+func P_VerifyIdAndGetUserEntry(ctx RequestContext, id string) (any, error) {
+	return _verifyIdAndGet(ctx, id, db.GetUserViewEntryById)
+}
+
+func P_VerifyIdAndGetInfoEntry(ctx RequestContext, id string) (any, error) {
+	return _verifyIdAndGet(ctx, id, db.GetInfoEntryById)
+}
+
+func P_VerifyIdAndGetMetaEntry(ctx RequestContext, id string) (any, error) {
+	return _verifyIdAndGet(ctx, id, db.GetMetadataForItemId)
+}
+
+func P_True(ctx RequestContext, in string) (any, error) {
+	if !utf8.ValidString(in) {
+		return in, errors.New("Invalid utf8")
+	}
+	return in, nil
+}
+
+func P_NotEmpty(ctx RequestContext, in string) (any, error) {
+	if !utf8.ValidString(in) {
+		return in, errors.New("Invalid utf8")
+	}
+	if in != "" {
+		return in, nil
+	}
+	return in, errors.New("Empty")
+}
+
+func P_SqlSafe(ctx RequestContext, in string) (any, error) {
+	if in == "" {
+		return in, errors.New("Empty")
+	}
+	match, err := regexp.Match("[0-9A-Za-z-_\\.]", []byte(in))
+	if err != nil {
+		return "", err
+	} else if match {
+		return in, nil
+	}
+	return in, fmt.Errorf("'%s' contains invalid characters", in)
+}
+
+func P_EntryFormat(ctx RequestContext, in string) (any, error) {
+	i, err := P_Int64(ctx, in)
+	if err != nil {
+		return 0, err
+	}
+	if !db_types.IsValidFormat(i.(int64)) {
+		return 0, fmt.Errorf("Invalid format '%s'", in)
+	}
+	return db_types.Format(i.(int64)), nil
+}
+
+func P_EntryType(ctx RequestContext, in string) (any, error) {
+	if db_types.IsValidType(in) {
+		return db_types.MediaTypes(in), nil
+	}
+	return db_types.MediaTypes("Show"), fmt.Errorf("Invalid entry type: '%s'", in)
+}
+
+func P_ArtStyle(ctx RequestContext, in string) (any, error) {
+	val, err := strconv.ParseUint(in, 10, 64)
+	if err != nil {
+		return uint(0), err
+	}
+	return uint(val), nil
+}
+
+func P_LocationProvider(ctx RequestContext, in string) (any, error) {
+	if metadata.IsValidLocationProvider(in) {
+		return in, nil
+	}
+	return in, fmt.Errorf("Invalid location provider: '%s'", in)
+}
+
+func P_MetaProvider(ctx RequestContext, in string) (any, error) {
+	if metadata.IsValidProvider(in) {
+		return in, nil
+	}
+	return in, fmt.Errorf("Invalid metadata provider: '%s'", in)
+}
+
+func P_UserStatus(ctx RequestContext, in string) (any, error) {
+	if db_types.IsValidStatus(in) {
+		return db_types.Status(in), nil
+	}
+	return "Planned", fmt.Errorf("Invalid user status: '%s'", in)
+}
+
+func P_TList[T any](sep string, toT func(in string) T) func(RequestContext, string) (any, error) {
+	return func(ctx RequestContext, in string) (any, error) {
+		var arr []T
+		items := strings.Split(in, sep)
+		for _, i := range items {
+			arr = append(arr, toT(i))
+		}
+		return arr, nil
+	}
+}
+
+func P_Uint64Array(ctx RequestContext, in string) (any, error) {
+	var arr []uint64
+	err := json.Unmarshal([]byte(in), &arr)
+	if err != nil {
+		return arr, err
+	}
+	return arr, nil
+}
+
+func P_UID(ctx RequestContext, in string) (any, error) {
+	uidInt, err := strconv.ParseInt(in, 10, 64)
+
+	if err != nil {
+		return 0, err
+	}
+	return uidInt, nil
+}
+
+func P_Bool(ctx RequestContext, in string) (any, error) {
+	if in == "true" || in == "on" {
+		return true, nil
+	}
+	if in == "" || in == "false" {
+		return false, nil
+	}
+	return false, fmt.Errorf("Not a boolean: '%s'", in)
+}
+
+func P_IdIdentifier(ctx RequestContext, in string) (any, error) {
+	if metadata.IsValidIdIdentifier(in) {
+		return in, nil
+	}
+	return "", fmt.Errorf("Invalid id identifier: '%s'", in)
+}
+
+func P_Identifier(ctx RequestContext, in string) (any, error) {
+	if metadata.IsValidIdentifier(in) {
+		return in, nil
+	}
+	return "", fmt.Errorf("Invalid identifier: '%s'", in)
+}
+
+func As_JsonMarshal(parser Parser) Parser {
+	return func(ctx RequestContext, in string) (any, error) {
+		v, err := parser(ctx, in)
+		if err != nil {
+			return "", err
+		}
+		res, err := json.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+		return string(res), nil
+	}
+}

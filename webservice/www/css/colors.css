@@ -1,0 +1,18 @@
+:root {
+    --pink: var(--media-tracker-pink, #f7c8e0);
+    --green: var(--media-tracker-green, #dfffd8);
+    --light-blue: var(--media-tracker-light-blue, #b4e4ff);
+    --blue: var(--media-tracker-blue, #95bdff);
+    --yellow: var(--media-tracker-yellow, #e5c890);
+    --lavender: var(--media-tracker-lavender, #b4befe);
+    --red: var(--media-tracker-red, #e78284);
+
+    --main: var(--media-tracker-main, #121626);
+    --secondary: var(--media-tracker-secondary, hsl(from var(--main) h s calc(l * 1.8)));
+
+    --input-border-color: var(--media-tracker-input-border-color, var(--blue));
+
+    --border-roundness: var(--media-tracker-border-roundness, 5px);
+
+    --text-color: var(--media-tracker-text-color, hsl(from var(--light-blue) h s 95%));
+}
